@@ -1,0 +1,56 @@
+package queries;
+
+import com.aeroflow.model.*;
+import com.aeroflow.model.events.*;
+import com.aeroflow.model.enums.*;
+import forward.Disruption;
+import forward.Fault;
+import java.time.temporal.ChronoUnit;
+import java.time.LocalDateTime;
+
+// 1. Upit: Ugroženi putnici u tranzitu
+query "GetEndangeredTransitPassengers"
+    $passenger : Passenger(currentStatus == PassengerStatus.SEVERELY_DELAYED)
+end
+
+// 2. Upit: Analiza hronično problematičnih ruta
+query "GetSevereDelaysByDestination" (String $destCode)
+    $itinerary : Itinerary(finalDestination == $destCode, $passenger: passenger)
+    $disruption : Disruption(passengerId == $passenger.passengerId)
+end
+
+// 3. Upit: Finansijski uticaj kaskadnih grešaka
+query "GetCompensationsByFaultParty" (String $faultParty)
+    $fault : Fault(party == $faultParty, $fn: flightNumber)
+    $itinerary : Itinerary($passenger: passenger, $flights: flights)
+    $f : Flight(flightNumber == $fn) from $flights
+    $comp : Compensation(passengerId == $passenger.passengerId,
+                         (type == CompensationType.HOTEL_AND_TRANSPORT || type == CompensationType.FULL_CARE_PACKAGE))
+end
+
+// 4. Upit: Kritične rute za transfer prtljaga
+query "GetSeparatedBaggageByFlight" (String $flightNumber)
+    $baggage : Baggage(status == BaggageStatus.SEPARATED, $assignedFlight: assignedFlight)
+    eval($assignedFlight != null && $assignedFlight.getFlightNumber().equals($flightNumber))
+end
+
+// 5. Upit: Izvještaj o isplativosti zadržavanja letova
+query "GetSmartHoldFlights"
+    $flight : Flight(status == FlightStatus.DELAYED, $fn: flightNumber)
+end
+
+// 6. Upit: Analiza infrastrukturnih grešaka terminala
+query "GetTerminalAnomalies"
+    $flight : Flight($fn: flightNumber, $gate: gate)
+    $itinerary : Itinerary($passenger: passenger, $flights: flights)
+    Flight(this == $flight) from $flights
+    $pScan : PassengerScanEvent(passengerId == $passenger.passengerId, location != null)
+    eval(!$pScan.getLocation().contains($gate))
+end
+
+// 7. Upit: Efikasnost kriznog bafera
+query "GetDisruptionsDuringWeatherEvent" (String $weatherCondition)
+    $weather : WeatherEvent(conditionType == $weatherCondition)
+    $disruption : Disruption($pid: passengerId)
+    $passenger : Passenger(passengerId == $pid)
+end

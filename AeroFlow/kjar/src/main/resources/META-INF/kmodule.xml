@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kmodule xmlns="http://www.drools.org/xsd/kmodule">
+    <kbase name="cepKbase" eventProcessingMode="stream" packages="cep">
+        <ksession name="cepKsession" type="stateful" clockType="realtime"/>
+    </kbase>
+
+    <kbase name="forwardKbase" packages="forward">
+        <ksession name="forwardKsession" type="stateful"/>
+    </kbase>
+
+    <kbase name="templateKbase" packages="templates">
+        <ksession name="templateKsession" type="stateful"/>
+    </kbase>
+
+    <kbase name="queryKbase" packages="queries">
+        <ksession name="queryKsession" type="stateful"/>
+    </kbase>
+</kmodule>

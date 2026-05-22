@@ -1,0 +1,34 @@
+template header
+airportCode
+transferType
+minTransferTime
+safetyBuffer
+delayThreshold
+totalTransferTime
+
+package templates;
+
+import com.aeroflow.model.*;
+import com.aeroflow.model.events.*;
+import com.aeroflow.model.enums.*;
+import java.time.temporal.ChronoUnit;
+
+template "Connection Threshold Template"
+
+rule "Dynamic Rebooking_@{airportCode}_@{transferType}"
+when
+    $flight1 : Flight(status == FlightStatus.DELAYED, destination.code == "@{airportCode}", actualArrival != null, scheduledArrival != null)
+
+    eval(Long.compare(ChronoUnit.MINUTES.between($flight1.getScheduledArrival(), $flight1.getActualArrival()), @{delayThreshold}) == 1)
+
+    $itinerary : Itinerary($passenger : passenger, $flights : flights)
+    Flight(this == $flight1) from $flights
+    $flight2 : Flight(origin.code == "@{airportCode}", status == FlightStatus.SCHEDULED, $scheduledDep : scheduledDeparture) from $flights
+
+    eval(Long.compare(ChronoUnit.MINUTES.between($flight1.getActualArrival(), $scheduledDep), @{totalTransferTime}) == -1)
+then
+    $passenger.setCurrentStatus(PassengerStatus.SEVERELY_DELAYED);
+    update($passenger);
+end
+
+end template

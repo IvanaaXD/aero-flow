@@ -1,0 +1,131 @@
+package cep;
+
+global com.aeroflow.service.services.DroolsEngineService logService;
+
+import com.aeroflow.model.*;
+import com.aeroflow.model.events.*;
+import com.aeroflow.model.enums.*;
+import java.time.temporal.ChronoUnit;
+
+declare FlightUpdateEvent
+    @role( event )
+    @timestamp( timestamp )
+end
+
+declare PassengerScanEvent
+    @role( event )
+    @timestamp( timestamp )
+end
+
+declare BaggageScanEvent
+    @role( event )
+    @timestamp( timestamp )
+end
+
+declare SecurityQueueEvent
+    @role( event )
+    @timestamp( timestamp )
+end
+
+declare GateChangedEvent
+    @role( event )
+    @timestamp( timestamp )
+end
+
+// ========================================================================
+// PRAVILO 1: Proaktivno rješavanje propuštenog presjedanja
+// ========================================================================
+rule "CEP 1: Detekcija kriticnog kasnjenja i Forward Chaining inicijalizacija"
+when
+    $event : FlightUpdateEvent($fn: flightNumber, status == FlightStatus.DELAYED, $newArrival: newEstimatedTime)
+    $flight1 : Flight(flightNumber == $fn, $destAirport: destination, $scheduledArr: scheduledArrival)
+
+    eval(ChronoUnit.MINUTES.between($scheduledArr, $newArrival) > 30)
+
+    $itinerary : Itinerary($passenger: passenger, $flights: flights)
+    Flight(this == $flight1) from $flights
+    $flight2 : Flight(origin.code == $destAirport.code, $scheduledDeparture : scheduledDeparture) from $flights
+
+    eval(ChronoUnit.MINUTES.between($newArrival, $scheduledDeparture) < 45)
+then
+    logService.log("\n[CEP PRAVILO 1] UPOZORENJE: Let " + $fn + " kasni preko 30 min. Presjedanje na let " + $flight2.getFlightNumber() + " je ugroženo za putnika: " + $passenger.getName());
+    modify($passenger) {
+        setCurrentStatus(PassengerStatus.SEVERELY_DELAYED)
+    }
+end
+
+// ========================================================================
+// PRAVILO 2: Detekcija kaskadnih kašnjenja i zagušenja aerodroma
+// ========================================================================
+rule "CEP 2: Kaskadna kasnjenja - Aktivacija zastitnog bafera"
+when
+    $brojKasnjenja : Number(intValue > 10) from accumulate (
+        $e: FlightUpdateEvent(status == FlightStatus.DELAYED) over window:time(15m),
+        count($e)
+    )
+    $sqEvent : SecurityQueueEvent(waitTimeIncrease > 200) over window:time(10m)
+then
+    logService.log("\n[CEP PRAVILO 2] KRIZA NA TERMINALU: Detektovano " + $brojKasnjenja + " kašnjenja i gužva na bezbjednosti! Sva MCT vremena se proaktivno povećavaju za 30 minuta.");
+end
+
+// ========================================================================
+// PRAVILO 3: Proaktivna detekcija odvajanja prtljaga
+// ========================================================================
+rule "CEP 3: Putnik na gejtu, prtljag nedostaje"
+when
+    $pScan : PassengerScanEvent($pid: passengerId, location == "GATE_DEPARTURE", $pTime: timestamp)
+    $baggage : Baggage(owner.passengerId == $pid, $tag: baggageTag)
+
+    not (
+        BaggageScanEvent(baggageTag == $tag, location == "TRANSFER_BELT", this before[0m, 20m] $pScan)
+    )
+then
+    logService.log("\n[CEP PRAVILO 3] ALARM ZA PRTLJAG: Putnik " + $pid + " je stigao na gejt, ali kofer " + $tag + " nije prošao transfer traku na vrijeme.");
+    modify($baggage) {
+        setStatus(BaggageStatus.SEPARATED)
+    }
+end
+
+// ========================================================================
+// PRAVILO 4: Ekonomska optimizacija zadržavanja leta
+// ========================================================================
+rule "CEP 4: Ekonomska isplativost zadrzavanja leta"
+when
+    // Hvatamo novo procijenjeno vrijeme direktno iz CEP događaja
+    $event : FlightUpdateEvent($fn: flightNumber, status == FlightStatus.DELAYED, $newArrival: newEstimatedTime)
+
+    $delayedFlight : Flight(flightNumber == $fn)
+    $connectingFlight : Flight($cFn: flightNumber, status == FlightStatus.SCHEDULED, $scheduledDep: scheduledDeparture)
+
+    eval($newArrival != null && $scheduledDep != null &&
+         ChronoUnit.MINUTES.between($scheduledDep, $newArrival) > 0 &&
+         ChronoUnit.MINUTES.between($scheduledDep, $newArrival) <= 15)
+
+    $brojPutnika : Number(intValue > 15) from accumulate (
+        $it : Itinerary(flights contains $delayedFlight, flights contains $connectingFlight),
+        count($it)
+    )
+then
+    logService.log("\n[CEP PRAVILO 4] SMART HOLD AKTIVIRAN: Zadržava se polazak leta " + $cFn + " jer dolazi grupa od " + $brojPutnika + " tranzitnih putnika iz leta " + $fn);
+    modify($connectingFlight) {
+        setStatus(FlightStatus.DELAYED)
+    }
+end
+
+// ========================================================================
+// PRAVILO 5: Kritična promjena gejta
+// ========================================================================
+rule "CEP 5: Hitno dispeciranje Transfer Cart vozila"
+when
+    $gateEvent : GateChangedEvent($fn: flightNumber)
+    $flight : Flight(flightNumber == $fn, $departure: scheduledDeparture)
+
+    eval(ChronoUnit.MINUTES.between(
+            java.time.LocalDateTime.ofInstant($gateEvent.getTimestamp().toInstant(), java.time.ZoneId.systemDefault()),
+            $departure
+        ) < 35)
+
+    $itinerary : Itinerary($passenger: passenger, flights contains $flight)
+then
+    logService.log("\n[CEP PRAVILO 5] LOGISTIKA UGROZENA: Let " + $fn + " je promijenio terminal! Automatski šaljem električno vozilo za putnika " + $passenger.getPassengerId());
+end
