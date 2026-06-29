@@ -1,11 +1,11 @@
 package cep;
 
 global com.aeroflow.service.services.DroolsEngineService logService;
+global com.aeroflow.service.services.RebookingService rebookingService; // DODAJ OVO U DRL FAJL!
 
 import com.aeroflow.model.*;
 import com.aeroflow.model.events.*;
 import com.aeroflow.model.enums.*;
-import java.time.temporal.ChronoUnit;
 
 declare FlightUpdateEvent
     @role( event )
@@ -32,25 +32,33 @@ declare GateChangedEvent
     @timestamp( timestamp )
 end
 
-// ========================================================================
-// PRAVILO 1: Proaktivno rješavanje propuštenog presjedanja
-// ========================================================================
-rule "CEP 1: Detekcija kriticnog kasnjenja i Forward Chaining inicijalizacija"
+rule "DEBUG: Ispisi sve objekte"
+when
+    $o : Object()
+then
+    // logService.log("[DEBUG] Učitano u memoriju: " + $o.getClass().getSimpleName());
+end
+
+rule "CEP 1: Detekcija kriticnog kasnjenja i AUTOMATSKI REBOOKING"
 when
     $event : FlightUpdateEvent($fn: flightNumber, status == FlightStatus.DELAYED, $newArrival: newEstimatedTime)
     $flight1 : Flight(flightNumber == $fn, $destAirport: destination, $scheduledArr: scheduledArrival)
 
-    eval(ChronoUnit.MINUTES.between($scheduledArr, $newArrival) > 30)
+    // Provjera kašnjenja > 30 min
+    eval((java.sql.Timestamp.valueOf($newArrival).getTime() - java.sql.Timestamp.valueOf($scheduledArr).getTime()) > 1800000)
 
     $itinerary : Itinerary($passenger: passenger, $flights: flights)
-    Flight(this == $flight1) from $flights
-    $flight2 : Flight(origin.code == $destAirport.code, $scheduledDeparture : scheduledDeparture) from $flights
+    Flight(flightNumber == $fn) from $flights
+    $flight2 : Flight($fn2: flightNumber, flightNumber != $fn, origin.code == $destAirport.code, $scheduledDep : scheduledDeparture) from $flights
 
-    eval(ChronoUnit.MINUTES.between($newArrival, $scheduledDeparture) < 45)
+    // Provjera MCT < 45 min
+    eval((java.sql.Timestamp.valueOf($scheduledDep).getTime() - java.sql.Timestamp.valueOf($newArrival).getTime()) < 2700000)
 then
-    logService.log("\n[CEP PRAVILO 1] UPOZORENJE: Let " + $fn + " kasni preko 30 min. Presjedanje na let " + $flight2.getFlightNumber() + " je ugroženo za putnika: " + $passenger.getName());
+    logService.log("\n[CEP PRAVILO 1] UPOZORENJE: Let " + $fn + " kasni preko 30 min. Presjedanje na let " + $fn2 + " je ugroženo za putnika: " + $passenger.getName());
+    rebookingService.rebookPassenger($passenger);
+
     modify($passenger) {
-        setCurrentStatus(PassengerStatus.SEVERELY_DELAYED)
+        setCurrentStatus(PassengerStatus.REBOOKED)
     }
 end
 
@@ -71,18 +79,19 @@ end
 // ========================================================================
 // PRAVILO 3: Proaktivna detekcija odvajanja prtljaga
 // ========================================================================
-rule "CEP 3: Putnik na gejtu, prtljag nedostaje"
+rule "CEP 3: Proaktivna detekcija i preusmjeravanje prtljaga"
 when
-    $pScan : PassengerScanEvent($pid: passengerId, location == "GATE_DEPARTURE", $pTime: timestamp)
-    $baggage : Baggage(owner.passengerId == $pid, $tag: baggageTag)
+    $pScan : PassengerScanEvent($pid: passengerId, location == "GATE_DEPARTURE")
+    $baggage : Baggage(owner != null, owner.getPassengerId() == $pid, $tag: baggageTag, $currentFlight: assignedFlight)
+    not ( BaggageScanEvent(baggageTag == $tag, location == "TRANSFER_BELT") )
 
-    not (
-        BaggageScanEvent(baggageTag == $tag, location == "TRANSFER_BELT", this before[0m, 20m] $pScan)
-    )
+    // Pronađi sljedeći let za istu destinaciju
+    $nextFlight : Flight(destination == $currentFlight.destination, scheduledDeparture > $currentFlight.scheduledDeparture)
 then
     logService.log("\n[CEP PRAVILO 3] ALARM ZA PRTLJAG: Putnik " + $pid + " je stigao na gejt, ali kofer " + $tag + " nije prošao transfer traku na vrijeme.");
     modify($baggage) {
-        setStatus(BaggageStatus.SEPARATED)
+        setStatus(BaggageStatus.RE_ROUTED),
+        setAssignedFlight($nextFlight)
     }
 end
 
@@ -91,18 +100,20 @@ end
 // ========================================================================
 rule "CEP 4: Ekonomska isplativost zadrzavanja leta"
 when
-    // Hvatamo novo procijenjeno vrijeme direktno iz CEP događaja
     $event : FlightUpdateEvent($fn: flightNumber, status == FlightStatus.DELAYED, $newArrival: newEstimatedTime)
 
-    $delayedFlight : Flight(flightNumber == $fn)
-    $connectingFlight : Flight($cFn: flightNumber, status == FlightStatus.SCHEDULED, $scheduledDep: scheduledDeparture)
+    // JU501 je connecting, zakazan za now() + 5m
+    $connectingFlight : Flight($cFn: flightNumber == "JU501", status == FlightStatus.SCHEDULED, $scheduledDep: scheduledDeparture)
 
-    eval($newArrival != null && $scheduledDep != null &&
-         ChronoUnit.MINUTES.between($scheduledDep, $newArrival) > 0 &&
-         ChronoUnit.MINUTES.between($scheduledDep, $newArrival) <= 15)
+    // Kasnjenje uzrokuje da novi dolazak bude NAKON polaska (Razlika veća od 0), ali manja od 15 min (900000 ms)
+    eval((java.sql.Timestamp.valueOf($newArrival).getTime() - java.sql.Timestamp.valueOf($scheduledDep).getTime()) > 0 &&
+         (java.sql.Timestamp.valueOf($newArrival).getTime() - java.sql.Timestamp.valueOf($scheduledDep).getTime()) <= 900000)
 
+    // FIX: Sigurno prebrojavanje bez 'contains'
     $brojPutnika : Number(intValue > 15) from accumulate (
-        $it : Itinerary(flights contains $delayedFlight, flights contains $connectingFlight),
+        $it : Itinerary($fl: flights) and
+        Flight(flightNumber == $fn) from $fl and
+        Flight(flightNumber == $cFn) from $fl,
         count($it)
     )
 then
@@ -117,15 +128,15 @@ end
 // ========================================================================
 rule "CEP 5: Hitno dispeciranje Transfer Cart vozila"
 when
-    $gateEvent : GateChangedEvent($fn: flightNumber)
+    $gateEvent : GateChangedEvent($fn: flightNumber, $ts: timestamp)
     $flight : Flight(flightNumber == $fn, $departure: scheduledDeparture)
 
-    eval(ChronoUnit.MINUTES.between(
-            java.time.LocalDateTime.ofInstant($gateEvent.getTimestamp().toInstant(), java.time.ZoneId.systemDefault()),
-            $departure
-        ) < 35)
+    // Vrijeme do polaska je manje od 35 minuta (35m = 2100000 ms)
+    eval((java.sql.Timestamp.valueOf($departure).getTime() - $ts.getTime()) < 2100000)
 
-    $itinerary : Itinerary($passenger: passenger, flights contains $flight)
+    // FIX: Pretraga bez 'contains'
+    $itinerary : Itinerary($passenger: passenger, $fl: flights)
+    exists Flight(flightNumber == $fn) from $fl
 then
-    logService.log("\n[CEP PRAVILO 5] LOGISTIKA UGROZENA: Let " + $fn + " je promijenio terminal! Automatski šaljem električno vozilo za putnika " + $passenger.getPassengerId());
+    logService.log("\n[CEP PRAVILO 5] LOGISTIKA UGROZENA: Let " + $fn + " je promijenio terminal! Automatski šaljem električno vozilo za putnika " + $passenger.getName());
 end

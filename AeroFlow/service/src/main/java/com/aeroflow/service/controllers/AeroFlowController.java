@@ -3,7 +3,11 @@ package com.aeroflow.service.controllers;
 import com.aeroflow.model.*;
 import com.aeroflow.model.enums.*;
 import com.aeroflow.model.events.*;
+import com.aeroflow.service.dto.BaggageAlertDTO;
+import com.aeroflow.service.dto.ScenarioRequestDTO;
+import com.aeroflow.service.repositories.PassengerRepository;
 import com.aeroflow.service.services.AnalyticsService;
+import com.aeroflow.service.services.DataInitializationService;
 import com.aeroflow.service.services.DroolsEngineService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -13,76 +17,22 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
-import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/v1/aeroflow")
-@CrossOrigin(origins = {"http://localhost:3000", "http://localhost:5173"})
 public class AeroFlowController {
 
     private final DroolsEngineService droolsEngine;
     private final AnalyticsService analyticsService;
+    private final DataInitializationService dataInitService;
+    private final PassengerRepository passengerRepo;
 
     @Autowired
-    public AeroFlowController(DroolsEngineService droolsEngine, AnalyticsService analyticsService) {
+    public AeroFlowController(DroolsEngineService droolsEngine, AnalyticsService analyticsService, DataInitializationService dataInitializationService, PassengerRepository passengerRepo) {
         this.droolsEngine = droolsEngine;
         this.analyticsService = analyticsService;
-    }
-
-    // ========================================================================
-    // 0. SETUP: Inteligentno namještanje radne memorije za okidanje svih pravila
-    // ========================================================================
-    @PostMapping("/setup")
-    public ResponseEntity<String> setupTestData() {
-        LocalDateTime now = LocalDateTime.now();
-        Airport fra = new Airport("FRA", "Frankfurt", null);
-        Airport beg = new Airport("BEG", "Belgrade", null);
-
-        // --- ZA PRAVILO 1 (Rebooking - MCT ugrožen) ---
-        Flight lh123 = new Flight("LH123", beg, fra, now.minusHours(2), null, now, null, "GATE_A1", FlightStatus.SCHEDULED, 50.0);
-        Flight lh456 = new Flight("LH456", fra, beg, now.plusMinutes(40), null, now.plusHours(7), null, "GATE_B2", FlightStatus.SCHEDULED, 50.0);
-        Passenger p1 = new Passenger("P-1000", "Marko Markovic", PassengerStatus.REGULAR);
-        Itinerary it1 = new Itinerary("ITIN-1", p1, List.of(lh123, lh456), "FRA");
-
-        droolsEngine.insertFact(lh123);
-        droolsEngine.insertFact(lh456);
-        droolsEngine.insertFact(p1);
-        droolsEngine.insertFact(it1);
-
-        // --- ZA PRAVILO 3 (Odvajanje prtljaga) ---
-        Passenger p2 = new Passenger("P-1001", "Ana Anic", PassengerStatus.REGULAR);
-        Baggage b1 = new Baggage("TAG-1001", p2, lh456, BaggageStatus.CHECKED_IN);
-
-        droolsEngine.insertFact(p2);
-        droolsEngine.insertFact(b1);
-
-        // --- ZA PRAVILO 4 (Ekonomska optimizacija / Smart Hold) ---
-        // JU500 stiže, a JU501 polijeće za samo 5 minuta.
-        Flight ju500 = new Flight("JU500", fra, beg, now.minusHours(1), null, now, null, "GATE_C1", FlightStatus.SCHEDULED, 50.0);
-        Flight ju501 = new Flight("JU501", beg, fra, now.plusMinutes(5), null, now.plusHours(1), null, "GATE_C2", FlightStatus.SCHEDULED, 50.0);
-
-        droolsEngine.insertFact(ju500);
-        droolsEngine.insertFact(ju501);
-
-        // Generišemo 16 putnika da bismo zadovoljili uslov (intValue > 15) u DRL-u
-        for (int i = 0; i < 16; i++) {
-            Passenger groupPass = new Passenger("GRP-" + i, "Turista " + i, PassengerStatus.REGULAR);
-            Itinerary groupItin = new Itinerary("ITIN-GRP-" + i, groupPass, List.of(ju500, ju501), "BEG");
-            droolsEngine.insertFact(groupPass);
-            droolsEngine.insertFact(groupItin);
-        }
-
-        // --- ZA PRAVILO 5 (Promjena Gejta) ---
-        // Let OS789 polijeće za 30 minuta (manje od 35m kritičnog vremena u pravilu)
-        Flight os789 = new Flight("OS789", beg, fra, now.plusMinutes(30), null, now.plusHours(2), null, "TERMINAL_2_G1", FlightStatus.SCHEDULED, 50.0);
-        Passenger p3 = new Passenger("P-2002", "Jovan Jovanovic", PassengerStatus.REGULAR);
-        Itinerary it3 = new Itinerary("ITIN-3", p3, List.of(os789), "BEG");
-
-        droolsEngine.insertFact(os789);
-        droolsEngine.insertFact(p3);
-        droolsEngine.insertFact(it3);
-
-        return ResponseEntity.ok("Sistem uspješno inicijalizovan. Spreman za simulacijuCEP događaja.");
+        this.dataInitService = dataInitializationService;
+        this.passengerRepo = passengerRepo;
     }
 
     // ========================================================================
@@ -111,13 +61,14 @@ public class AeroFlowController {
             delayEvent.setTimestamp(new Date());
             delayEvent.setFlightNumber("FAKE-" + i);
             delayEvent.setStatus(FlightStatus.DELAYED);
+
+            delayEvent.setNewEstimatedTime(LocalDateTime.now().plusMinutes(45));
             droolsEngine.insertEvent(delayEvent);
         }
 
-        // Dodajemo događaj naglog rasta gužve na sigurnosnoj provjeri
         SecurityQueueEvent sqEvent = new SecurityQueueEvent();
         sqEvent.setTimestamp(new Date());
-        sqEvent.setWaitTimeIncrease(250.0); // Preko praga od 200
+        sqEvent.setWaitTimeIncrease(250.0);
         droolsEngine.insertEvent(sqEvent);
 
         return ResponseEntity.ok("Kaskadna kriza (Bottleneck) uspješno simulirana!");
@@ -148,7 +99,6 @@ public class AeroFlowController {
         gateEvent.setFlightNumber(request.getFlightNumber());
         droolsEngine.insertEvent(gateEvent);
 
-        // 2. Skeniranje putnika na pogrešnom terminalu
         PassengerScanEvent wrongScan = new PassengerScanEvent();
         wrongScan.setTimestamp(new Date());
         wrongScan.setPassengerId(request.getPassengerId());
@@ -173,11 +123,6 @@ public class AeroFlowController {
         return ResponseEntity.ok(savings);
     }
 
-
-    // ========================================================================
-    // INNER DTO KLASE ZA PRIJEM PODATAKA IZ REACT-A
-    // ========================================================================
-
     public static class FlightUpdateRequestDTO {
         private String flightNumber;
         private String status;
@@ -199,6 +144,92 @@ public class AeroFlowController {
         public void setPassengerId(String passengerId) { this.passengerId = passengerId; }
         public String getLocation() { return location; }
         public void setLocation(String location) { this.location = location; }
+    }
+
+    @GetMapping("/analytics/baggage-alerts")
+    public ResponseEntity<List<BaggageAlertDTO>> getBaggageAlerts() {
+        List<BaggageAlertDTO> alerts = new ArrayList<>();
+        for (Object obj : droolsEngine.getCepSession().getObjects()) {
+            if (obj instanceof Baggage) {
+                Baggage b = (Baggage) obj;
+                
+                if (b.getStatus() == BaggageStatus.SEPARATED || b.getStatus() == BaggageStatus.RE_ROUTED) {
+
+                    BaggageAlertDTO dto = new BaggageAlertDTO();
+                    dto.setBaggageTag(b.getBaggageTag());
+                    dto.setStatus(b.getStatus().toString());
+                    dto.setOwner(b.getOwner());
+                    dto.setPassengerId(b.getOwner() != null ? b.getOwner().getPassengerId() : "N/A");
+                    dto.setName(b.getOwner() != null ? b.getOwner().getName() : "Unknown");
+
+                    if (b.getStatus() == BaggageStatus.RE_ROUTED && b.getAssignedFlight() != null) {
+                        dto.setNextFlight(b.getAssignedFlight().getFlightNumber());
+                    } else {
+                        dto.setNextFlight("N/A");
+                    }
+                    alerts.add(dto);
+                }
+            }
+        }
+        return ResponseEntity.ok(alerts);
+    }
+
+    @GetMapping("/analytics/gate-anomalies")
+    public ResponseEntity<List<PassengerScanEvent>> getGateAnomalies() {
+        return ResponseEntity.ok(analyticsService.getTerminalAnomalies(droolsEngine.getCepSession()));
+    }
+
+    @PostMapping("/events/simulate-fault")
+    public ResponseEntity<String> simulateFault(@RequestBody String party) {
+        Fault fault = new Fault();
+        fault.setParty("Airline_Fault");
+        droolsEngine.insertFact(fault);
+
+        return ResponseEntity.ok("Kvar avio-kompanije evidentiran.");
+    }
+
+    @GetMapping("/analytics/compensations")
+    public ResponseEntity<List<Compensation>> getCompensations() {
+        List<Compensation> compensations = new ArrayList<>();
+        for (Object obj : droolsEngine.getCepSession().getObjects()) {
+            if (obj instanceof Compensation) {
+                compensations.add((Compensation) obj);
+            }
+        }
+        return ResponseEntity.ok(compensations);
+    }
+
+    @PostMapping("/setup/day")
+    public ResponseEntity<String> setupDay(@RequestBody ScenarioRequestDTO req) {
+        // Sada možeš koristiti req.getPassengerId() u servisu
+        dataInitService.seedDayLayoverScenario(req.getPassengerId(), req.getFlightNumber());
+        return ResponseEntity.ok("Scenario: Dnevno čekanje učitan za " + req.getPassengerId());
+    }
+
+    @PostMapping("/setup/night")
+    public ResponseEntity<String> setupNight(@RequestBody ScenarioRequestDTO req) {
+        dataInitService.seedOvernightScenario(req.getPassengerId(), req.getFlightNumber());
+        return ResponseEntity.ok("Scenario: Noćenje učitano za " + req.getPassengerId());
+    }
+
+    @PostMapping("/setup/group")
+    public ResponseEntity<String> setupGroup(@RequestBody ScenarioRequestDTO req) {
+        dataInitService.seedGroupHoldScenario();
+        return ResponseEntity.ok("Scenario: Grupni let (" + req.getGroupSize() + " putnika) učitan.");
+    }
+
+    @GetMapping("/analytics/smart-hold-flights")
+    public ResponseEntity<List<Flight>> getSmartHoldFlights() {
+        List<Flight> delayedFlights = new ArrayList<>();
+        for (Object obj : droolsEngine.getCepSession().getObjects()) {
+            if (obj instanceof Flight) {
+                Flight f = (Flight) obj;
+                if (f.getStatus() == FlightStatus.DELAYED && f.getFlightNumber().equals("JU501")) {
+                    delayedFlights.add(f);
+                }
+            }
+        }
+        return ResponseEntity.ok(delayedFlights);
     }
 
     public static class GateChangeRequestDTO {

@@ -1,6 +1,7 @@
 package com.aeroflow.service.services;
 
 import com.aeroflow.model.*;
+import com.aeroflow.model.enums.FlightStatus;
 import com.aeroflow.model.events.PassengerScanEvent;
 import org.kie.api.runtime.KieSession;
 import org.kie.api.runtime.rule.QueryResults;
@@ -86,5 +87,16 @@ public class AnalyticsService {
     public int getDisruptionsDuringWeatherEvent(KieSession session, String weatherCondition) {
         QueryResults results = session.getQueryResults("GetDisruptionsDuringWeatherEvent", weatherCondition);
         return results.size();
+    }
+
+    public List<Flight> getSmartHoldFlights(KieSession session) {
+        List<Flight> flights = new ArrayList<>();
+        QueryResults results = session.getQueryResults("GetSmartHoldFlights");
+
+        for (QueryResultsRow row : results) {
+            Flight f = (Flight) row.get("$flight");
+            flights.add(f);
+        }
+        return flights;
     }
 }

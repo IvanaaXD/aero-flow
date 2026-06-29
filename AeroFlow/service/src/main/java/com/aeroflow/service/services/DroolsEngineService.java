@@ -2,17 +2,17 @@ package com.aeroflow.service.services;
 
 import com.aeroflow.model.events.Event;
 import com.aeroflow.service.dto.ConnectionThresholdTemplateModel;
-import org.drools.template.ObjectDataCompiler;
 import org.kie.api.KieBaseConfiguration;
 import org.kie.api.KieServices;
 import org.kie.api.conf.EventProcessingOption;
-import org.kie.api.io.ResourceType;
 import org.kie.api.io.ResourceType;
 import org.kie.api.runtime.KieContainer;
 import org.kie.api.runtime.KieSession;
 import org.kie.internal.utils.KieHelper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.kie.api.runtime.rule.FactHandle;
+import java.util.Collection;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -28,8 +28,8 @@ public class DroolsEngineService {
 
     private final KieContainer kieContainer;
     private KieSession cepSession;
+    private final RebookingService rebookingService;
 
-    // Thread-safe lista za čuvanje logova
     private final List<String> backendLogs = Collections.synchronizedList(new ArrayList<>());
 
     public List<String> getBackendLogs() {
@@ -44,8 +44,10 @@ public class DroolsEngineService {
     }
 
     @Autowired
-    public DroolsEngineService(KieContainer kieContainer) {
+    public DroolsEngineService(KieContainer kieContainer, RebookingService rebookingService) {
+
         this.kieContainer = kieContainer;
+        this.rebookingService = rebookingService;
     }
 
     @PostConstruct
@@ -61,7 +63,7 @@ public class DroolsEngineService {
                 this.getClass().getResourceAsStream("/data/european_hubs_thresholds.csv")))) {
 
             String line;
-            br.readLine(); // Preskačemo header
+            br.readLine();
 
             while ((line = br.readLine()) != null) {
                 String[] values = line.split(",");
@@ -121,6 +123,7 @@ public class DroolsEngineService {
 
         this.cepSession = kieHelper.build(config).newKieSession();
         this.cepSession.setGlobal("logService", this);
+        this.cepSession.setGlobal("rebookingService", this.rebookingService); // <--- DODAJ OVO!
 
         log("==== 2. KONAČNA SESIJA POKRENUTA U STREAM MODU ====");
     }
@@ -145,5 +148,21 @@ public class DroolsEngineService {
             this.cepSession.dispose();
             log("==== Sesija zatvorena. ====");
         }
+    }
+
+    public void clearSession() {
+        if (this.cepSession != null) {
+
+            Collection<FactHandle> allHandles = new ArrayList<>(this.cepSession.getFactHandles());
+
+            for (FactHandle fh : allHandles) {
+                this.cepSession.delete(fh);
+            }
+            log("==== Sesija očišćena i spremna za nove podatke ====");
+        }
+    }
+
+    public void clearLogs() {
+        backendLogs.clear();
     }
 }

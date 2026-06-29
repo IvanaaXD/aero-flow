@@ -3,14 +3,15 @@ package queries;
 import com.aeroflow.model.*;
 import com.aeroflow.model.events.*;
 import com.aeroflow.model.enums.*;
-import forward.Disruption;
-import forward.Fault;
 import java.time.temporal.ChronoUnit;
 import java.time.LocalDateTime;
 
-// 1. Upit: Ugroženi putnici u tranzitu
+import com.aeroflow.model.Disruption;
+import com.aeroflow.model.Fault;
+
+// 1. Upit: Ugroženi putnici u tranzitu (Sada prikazuje i riješene)
 query "GetEndangeredTransitPassengers"
-    $passenger : Passenger(currentStatus == PassengerStatus.SEVERELY_DELAYED)
+    $passenger : Passenger(currentStatus == PassengerStatus.SEVERELY_DELAYED || currentStatus == PassengerStatus.REBOOKED)
 end
 
 // 2. Upit: Analiza hronično problematičnih ruta
@@ -36,7 +37,7 @@ end
 
 // 5. Upit: Izvještaj o isplativosti zadržavanja letova
 query "GetSmartHoldFlights"
-    $flight : Flight(status == FlightStatus.DELAYED, $fn: flightNumber)
+    $flight : Flight(status == FlightStatus.DELAYED)
 end
 
 // 6. Upit: Analiza infrastrukturnih grešaka terminala
@@ -54,3 +55,4 @@ query "GetDisruptionsDuringWeatherEvent" (String $weatherCondition)
     $disruption : Disruption($pid: passengerId)
     $passenger : Passenger(passengerId == $pid)
 end
+

@@ -4,41 +4,33 @@ global com.aeroflow.service.services.DroolsEngineService logService;
 
 import com.aeroflow.model.*;
 import com.aeroflow.model.enums.*;
-import java.time.temporal.ChronoUnit;
 import com.aeroflow.service.services.DroolsEngineService;
-
-// ========================================================================
-// DEKLARACIJA INTERNIH ČINJENICA (Pomoćne klase za rezonovanje)
-// ========================================================================
-declare Disruption
-    passengerId: String
-    impact: String
-end
-
-declare Fault
-    flightNumber: String
-    party: String
-end
+import com.aeroflow.model.Fault;
+import com.aeroflow.model.Disruption;
+import com.aeroflow.model.Compensation;
+import com.aeroflow.model.Flight;
+import com.aeroflow.model.Itinerary;
+import com.aeroflow.model.Passenger;
 
 // ========================================================================
 // NIVO 1: Klasifikacija statusa putnika
 // ========================================================================
 rule "Nivo 1: Detekcija ekstremnog kasnjenja i promjena statusa"
 when
-    // Let kasni i znamo njegovo planirano i stvarno vrijeme dolaska
     $flight: Flight($fn: flightNumber, status == FlightStatus.DELAYED, actualArrival != null, scheduledArrival != null)
 
-    // Kašnjenje je strogo veće od 60 minuta
-    eval(ChronoUnit.MINUTES.between($flight.getScheduledArrival(), $flight.getActualArrival()) > 60)
+    // Kašnjenje > 60m (3600000 ms)
+    eval((java.sql.Timestamp.valueOf($flight.getActualArrival()).getTime() - java.sql.Timestamp.valueOf($flight.getScheduledArrival()).getTime()) > 3600000)
 
-    // Putnik se nalazi na tom letu
     $itinerary: Itinerary($passenger: passenger, flights contains $flight)
+    eval($passenger.getCurrentStatus() == PassengerStatus.SEVERELY_DELAYED || $passenger.getCurrentStatus() == PassengerStatus.REBOOKED)
 then
-    logService.log("\n[FORWARD NIVO 1] Let " + $fn + " kasni > 60m. Mijenjam status putnika " + $passenger.getName() + " u SEVERELY_DELAYED.");
+    logService.log("[FORWARD NIVO 1] Putnik " + $passenger.getName() + " je u statusu " + $passenger.getCurrentStatus() + ". Pokrecem analizu kompenzacije.");
 
-    // MODIFY okida ponovnu evaluaciju pravila (okida Nivo 2)
-    modify($passenger) {
-        setCurrentStatus(PassengerStatus.SEVERELY_DELAYED)
+    if($passenger.getCurrentStatus() != PassengerStatus.SEVERELY_DELAYED) {
+        modify($passenger) {
+            setCurrentStatus(PassengerStatus.SEVERELY_DELAYED)
+        }
     }
 end
 
@@ -47,72 +39,60 @@ end
 // ========================================================================
 rule "Nivo 2A: Dnevno cekanje (LONG_DAYTIME_LAYOVER)"
 when
-    // Pravilo se aktivira tek kada Nivo 1 postavi ovaj status
-    $passenger: Passenger(currentStatus == PassengerStatus.SEVERELY_DELAYED, $pid: passengerId)
+    $passenger: Passenger(currentStatus == PassengerStatus.SEVERELY_DELAYED)
     $itinerary: Itinerary(passenger == $passenger, $flights: flights)
-
-    // Pronalazak sljedećeg leta
     $nextFlight: Flight(status == FlightStatus.SCHEDULED, $depTime: scheduledDeparture) from $flights
 
-    // Simulacija uslova: Čekanje je veće od 6 sati, ali let je ISTOG dana
     eval($depTime != null && $depTime.toLocalDate().equals(java.time.LocalDate.now()))
-    eval(ChronoUnit.HOURS.between(java.time.LocalDateTime.now(), $depTime) > 6)
+    eval((java.sql.Timestamp.valueOf($depTime).getTime() - System.currentTimeMillis()) > 21600000)
 then
-    logService.log("[FORWARD NIVO 2A] Dnevno čekanje duže od 6h za putnika: " + $pid);
-
-    // INSERT okida Nivo 3
-    insert(new Disruption($pid, "LONG_DAYTIME_LAYOVER"));
+    logService.log("[FORWARD NIVO 2A] Dnevno čekanje duže od 6h za putnika: " + $passenger.getPassengerId());
+    insert(new Disruption($passenger.getPassengerId(), "LONG_DAYTIME_LAYOVER"));
 end
 
 rule "Nivo 2B: Nocno cekanje (OVERNIGHT_STAY_REQUIRED)"
 when
-    $passenger: Passenger(currentStatus == PassengerStatus.SEVERELY_DELAYED, $pid: passengerId)
+    $passenger: Passenger(currentStatus == PassengerStatus.SEVERELY_DELAYED)
     $itinerary: Itinerary(passenger == $passenger, $flights: flights)
-
     $nextFlight: Flight(status == FlightStatus.SCHEDULED, $depTime: scheduledDeparture) from $flights
 
-    // Uslov: Let je sljedećeg kalendarskog dana
     eval($depTime != null && $depTime.toLocalDate().isAfter(java.time.LocalDate.now()))
 then
-    logService.log("[FORWARD NIVO 2B] Potrebno noćenje za putnika: " + $pid);
-
-    // INSERT okida Nivo 3
-    insert(new Disruption($pid, "OVERNIGHT_STAY_REQUIRED"));
+    logService.log("[FORWARD NIVO 2B] Potrebno noćenje za putnika: " + $passenger.getPassengerId());
+    insert(new Disruption($passenger.getPassengerId(), "OVERNIGHT_STAY_REQUIRED"));
 end
 
 // ========================================================================
-// NIVO 3: Odluka o nivou kompenzacije
+// NIVO 3: Odluka o nivou kompenzacije (SA SMS PORUKAMA)
 // ========================================================================
 rule "Nivo 3A: Dodjela Lounge pristupa i obroka"
 when
-    // Pravilo čeka činjenicu iz Nivoa 2A
     $disruption: Disruption(impact == "LONG_DAYTIME_LAYOVER", $pid: passengerId)
-
-    // Provjera da li je krivica do kompanije
     Fault(party == "Airline_Fault")
-
-    $passenger: Passenger(passengerId == $pid)
-    $itinerary: Itinerary(passenger == $passenger)
+    $passenger: Passenger(getPassengerId() == $pid)
 then
     logService.log("[FORWARD NIVO 3A] Akcija: Generišem kompenzaciju LOUNGE_ACCESS_AND_MEALS za putnika: " + $pid);
 
     Compensation comp = new Compensation();
     comp.setType(CompensationType.LOUNGE_ACCESS_AND_MEALS);
-    insert(comp); // Sistem sada može preko API-ja preuzeti ovu kompenzaciju i poslati QR kod
+    comp.setPassenger($passenger);
+    // SMS poruka
+    comp.setMessage("SMS: Poštovani " + $passenger.getName() + ", zbog kašnjenja ostvarili ste pravo na besplatan obrok i Lounge pristup na aerodromu.");
+    insert(comp);
 end
 
 rule "Nivo 3B: Dodjela Hotela i prevoza"
 when
-    // Pravilo čeka činjenicu iz Nivoa 2B
     $disruption: Disruption(impact == "OVERNIGHT_STAY_REQUIRED", $pid: passengerId)
-
     Fault(party == "Airline_Fault")
-
-    $passenger: Passenger(passengerId == $pid)
+    $passenger: Passenger(getPassengerId() == $pid)
 then
     logService.log("[FORWARD NIVO 3B] Akcija: Generišem kompenzaciju HOTEL_AND_TRANSPORT za putnika: " + $pid);
 
     Compensation comp = new Compensation();
     comp.setType(CompensationType.HOTEL_AND_TRANSPORT);
-    insert(comp); // Sistem preuzima ovo i rezerviše sobu
+    comp.setPassenger($passenger);
+    // SMS poruka
+    comp.setMessage("SMS: Poštovani " + $passenger.getName() + ", zbog neophodnog noćenja obezbijedili smo Vam hotel i organizovan taxi prevoz.");
+    insert(comp);
 end
